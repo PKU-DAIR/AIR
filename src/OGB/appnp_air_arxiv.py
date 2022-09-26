@@ -8,22 +8,21 @@ from model import appnp_air
 from utils import train, test, set_seed
 from logger import Logger
 
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--runs', type=int, default=10)
 parser.add_argument('--epochs', type=int, default=1000)
 parser.add_argument('--lr', type=float, default=0.005)
 parser.add_argument('--hidden', type=int, default=256)
-parser.add_argument('--dropout', type=float, default=0.2)
-parser.add_argument('--K', type=int, default=16)
+parser.add_argument('--dropout', type=float, default=0.6)
+parser.add_argument('--num_hops', type=int, default=16)
 parser.add_argument('--weight_decay', type=float, default=0)
-parser.add_argument('--log_steps', type=int, default=1)
+parser.add_argument('--log_steps', type=int, default=10)
 parser.add_argument('--root', type=str, default='./')
+parser.add_argument("--dataset", type=str, default="ogbn-arxiv")
 args = parser.parse_args()
 print(args)
-
 set_seed(42)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda:2' if torch.cuda.is_available() else 'cpu')
 
 dataset = PygNodePropPredDataset(name='ogbn-arxiv', root=args.root)
 data = dataset[0]
@@ -43,7 +42,7 @@ evaluator = Evaluator(name='ogbn-arxiv')
 logger = Logger(args.runs, None)
 
 model = appnp_air(num_features, num_classes, args.hidden,
-                  args.K, args.dropout).to(device)
+                  args.num_hops, args.dropout).to(device)
 print('#Parameters:', sum(p.numel() for p in model.parameters()))
 
 for run in range(args.runs):
@@ -52,9 +51,9 @@ for run in range(args.runs):
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     for epoch in range(1, 1 + args.epochs):
         loss = train(model, data, train_idx, optimizer)
-        result = test(model, data, split_idx, evaluator)
-        logger.add_result(run, result)
         if epoch % args.log_steps == 0:
+            result = test(model, data, split_idx, evaluator)
+            logger.add_result(run, result)
             train_acc, valid_acc, test_acc = result
             print(f'Run: {run + 1:02d}, '
                   f'Epoch: {epoch:02d}, '

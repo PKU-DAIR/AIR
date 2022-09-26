@@ -70,11 +70,11 @@ To reproduce the experimental results on the three small citation networks, plea
 ```bash
 cd ./src
 
-python gcn_air.py --dataset cora --lr 0.01 --weight_decay 1e-3 --hidden 32 --dropout 0.5 --hops 6
+python gcn_air.py --dataset cora --lr 0.01 --weight_decay 5e-4 --hidden 50 --dropout 0.8 --hops 4
 
-python gcn_air.py --dataset citeseer --lr 0.01 --weight_decay 1e-2 --hidden 16 --dropout 0.3 --hops 4
+python gcn_air.py --dataset citeseer --lr 0.01 --weight_decay 1e-2 --hidden 40 --dropout 0.6 --hops 2
 
-python gcn_air.py --dataset pubmed --lr 0.1 --weight_decay 1e-3 --hidden 32 --dropout 0.5 --hops 4
+python gcn_air.py --dataset pubmed --lr 0.1 --weight_decay 1e-3 --hidden 40 --dropout 0.7 --hops 2
 ```
 
 For the ogbn-arxiv dataset, please run the following commands:

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from layer import FeedForwardNet, FeedForwardNetII, Prop, GCNdenseConv
+from layer import FeedForwardNet, FeedForwardNetII, FeedForwardNetIII, Prop, GCNdenseConv
 
 
 class sgc_air(nn.Module):
@@ -80,21 +80,23 @@ class appnp_air(torch.nn.Module):
         super(appnp_air, self).__init__()
         self.lin1 = nn.Linear(num_features, hidden)
         self.lin2 = nn.Linear(hidden, num_classes)
-        self.bn = torch.nn.BatchNorm1d(hidden)
+        self.trans = FeedForwardNetIII(
+            num_features, hidden, num_classes, 4, dropout)
+        self.bn1 = torch.nn.BatchNorm1d(hidden)
+        self.bn2 = torch.nn.BatchNorm1d(num_classes)
         self.prop = Prop(num_classes, K)
         self.dropout = dropout
 
     def reset_parameters(self):
         self.lin1.reset_parameters()
         self.lin2.reset_parameters()
-        self.bn.reset_parameters()
+        self.bn1.reset_parameters()
+        self.bn2.reset_parameters()
         self.prop.reset_parameters()
 
     def forward(self, data):
         x, edge_index, norm = data.x, data.edge_index, data.norm
-        x = F.relu(self.bn(self.lin1(x)))
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.lin2(x)
+        x = self.trans(x)
         x = self.prop(x, edge_index, norm)
         return F.log_softmax(x, dim=1)
 
@@ -115,16 +117,15 @@ class gcn_air(torch.nn.Module):
         self.alpha = alpha
 
     def forward(self, data):
-        x, edge_index, edge_weight = data.x, data.edge_index, data.edge_attr
+        x, edge_index, norm = data.x, data.edge_index, data.norm
         _hidden = []
         x = F.dropout(x, self.dropout, training=self.training)
         x = F.relu(self.convs[0](x))
-        _hidden.append(x)
+        x0 = x
         for _, con in enumerate(self.convs[1:-1]):
             x = F.dropout(x, self.dropout, training=self.training)
-            x = F.relu(con(x, edge_index, self.alpha,
-                       _hidden[0], edge_weight))+_hidden[-1]
-            _hidden.append(x)
+            x = F.relu(con(x, edge_index,
+                       x0, norm))
         x = F.dropout(x, self.dropout, training=self.training)
         x = self.convs[-1](x)
         return F.log_softmax(x, dim=1)

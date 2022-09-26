@@ -8,6 +8,7 @@ from torch_geometric.nn.inits import glorot
 from torch_geometric.utils import add_remaining_self_loops
 from torch_scatter import scatter_add
 from torch_sparse import SparseTensor, matmul
+import torch.nn.functional as F
 
 
 # adapted from https://github.com/chennnM/GBP
@@ -37,9 +38,9 @@ class Dense(nn.Module):
 
 
 # MLP apply initial residual
-class GraphConvolution(nn.Module):
+class residualayer(nn.Module):
     def __init__(self, in_features, out_features):
-        super(GraphConvolution, self).__init__()
+        super(residualayer, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.weight = Parameter(torch.FloatTensor(
@@ -53,15 +54,44 @@ class GraphConvolution(nn.Module):
         self.weight.data.uniform_(-stdv, stdv)
 
     def forward(self, input, h0):
-        support = (1-self.alpha)*input+self.alpha*h0
+        #        support = (1-self.alpha)*input+self.alpha*h0
+        support = input+h0
+        output = torch.mm(support, self.weight)
+        output = self.bias(output)
+#        if self.in_features == self.out_features:
+#            output = output+input
+        return output
+
+# MLP apply initial residual
+
+
+class denseresidualayer(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(denseresidualayer, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = Parameter(torch.FloatTensor(
+            self.in_features, self.out_features))
+        self.alpha = 0.5
+        self.reset_parameters()
+        self.bias = nn.BatchNorm1d(out_features)
+
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.out_features)
+        self.weight.data.uniform_(-stdv, stdv)
+
+    def forward(self, input, h0):
+        #        support = (1-self.alpha)*input+self.alpha*h0
+        support = input+h0
         output = torch.mm(support, self.weight)
         output = self.bias(output)
         if self.in_features == self.out_features:
             output = output+input
         return output
 
-
 # adapted from dgl sign
+
+
 class FeedForwardNet(nn.Module):
     def __init__(self, in_feats, hidden, out_feats, n_layers, dropout):
         super(FeedForwardNet, self).__init__()
@@ -109,9 +139,46 @@ class FeedForwardNetII(nn.Module):
         else:
             self.layers.append(Dense(in_feats, hidden))
             for i in range(n_layers - 2):
-                self.layers.append(GraphConvolution(hidden, hidden))
+                self.layers.append(denseresidualayer(hidden, hidden))
             self.layers.append(Dense(hidden, out_feats))
+        self.prelu = nn.PReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.reset_parameters()
 
+    def reset_parameters(self):
+        for layer in self.layers:
+            layer.reset_parameters()
+
+    def forward(self, x):
+        x = self.layers[0](x)
+        h0 = x
+        for layer_id, layer in enumerate(self.layers):
+            if layer_id == 0:
+                continue
+            elif layer_id == self.n_layers - 1:
+                x = self.dropout(self.prelu(x))
+                x = layer(x)
+            else:
+                x = self.dropout(self.prelu(x))
+                x = layer(x, h0)
+        return x
+
+
+class FeedForwardNetIII(nn.Module):
+    def __init__(self, in_feats, hidden, out_feats, n_layers, dropout):
+        super(FeedForwardNetII, self).__init__()
+        self.layers = nn.ModuleList()
+        self.n_layers = n_layers
+        self.in_feats = in_feats
+        self.hidden = hidden
+        self.out_feats = out_feats
+        if n_layers == 1:
+            self.layers.append(nn.Linear(in_feats, out_feats, bias=False))
+        else:
+            self.layers.append(Dense(in_feats, hidden))
+            for i in range(n_layers - 2):
+                self.layers.append(residualayer(hidden, hidden))
+            self.layers.append(Dense(hidden, out_feats))
         self.prelu = nn.PReLU()
         self.dropout = nn.Dropout(dropout)
         self.reset_parameters()
@@ -163,20 +230,31 @@ class Prop(MessagePassing):
         self.proj = nn.Linear(num_classes, 1)
         self.lr_att = nn.Linear(num_classes+num_classes, 1)
         self.att_drop = torch.nn.Dropout(0.5)
+        self.alpha = 0.95
+        self.lr_att = nn.Linear(num_classes+num_classes, 1)
 
     def forward(self, x, edge_index, edge_weight=None):
         edge_index, norm = gcn_norm(
             edge_index, edge_weight, x.size(0), dtype=x.dtype)
-        alpha = 0.95
         x0 = x
         preds = []
         preds.append(x)
         for _ in range(self.K):
             x = self.propagate(edge_index, x=x, norm=norm)
-            x = alpha*x+(1-alpha)*x0
+            x = self.alpha*x+(1-self.alpha)*x0
             preds.append(x)
-        out = preds[-1]
-        return out
+        num_node = x.shape[0]
+        attention_scores = []
+        for i in range(len(preds)):
+            attention_scores.append(torch.sigmoid(self.lr_att(
+                torch.cat([preds[0], preds[i]], dim=1))))
+        attention_scores = torch.cat(attention_scores, dim=1)
+        W = F.softmax(attention_scores, 1)
+        output = torch.mul(preds[0], self.att_drop(W[:, 0].view(num_node, 1)))
+        for i in range(1, self.K):
+            output = output + \
+                torch.mul(preds[i], self.att_drop(W[:, i].view(num_node, 1)))
+        return output
 
     def message(self, x_j, norm):
         return norm.view(-1, 1) * x_j
@@ -198,65 +276,34 @@ class GCNdenseConv(MessagePassing):
 
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.improved = improved
-        self.cached = cached
-        self.normalize = normalize
         self.add_self_loops = add_self_loops
         self.lr_att = nn.Linear(out_channels+out_channels, 1)
-        self._cached_edge_index = None
-        self._cached_adj_t = None
 
         self.weight1 = Parameter(torch.Tensor(in_channels, out_channels))
         self.weight2 = Parameter(torch.Tensor(in_channels, out_channels))
-        if bias == 'bn':
-            self.norm = nn.BatchNorm1d(out_channels)
-        elif bias == 'ln':
-            self.norm = nn.LayerNorm(out_channels)
+        self.norm = nn.BatchNorm1d(out_channels)
 
         self.reset_parameters()
 
     def reset_parameters(self):
         glorot(self.weight1)
         glorot(self.weight2)
-        self._cached_edge_index = None
-        self._cached_adj_t = None
 
-    def forward(self, x, edge_index, alpha, h0, edge_weight):
-        if self.normalize:
-            if isinstance(edge_index, Tensor):
-                cache = self._cached_edge_index
-                if cache is None:
-                    edge_index, edge_weight = gcn_norm(  # yapf: disable
-                        edge_index, edge_weight, x.size(self.node_dim),
-                        self.improved, self.add_self_loops, dtype=x.dtype)
-                    if self.cached:
-                        self._cached_edge_index = (edge_index, edge_weight)
-                else:
-                    edge_index, edge_weight = cache[0], cache[1]
+    def forward(self, x, edge_index, h0, edge_weight=None):
+        edge_index, norm = gcn_norm(
+            edge_index, edge_weight, x.size(0), dtype=x.dtype)
 
-            elif isinstance(edge_index, SparseTensor):
-                cache = self._cached_adj_t
-                if cache is None:
-                    edge_index = gcn_norm(  # yapf: disable
-                        edge_index, edge_weight, x.size(self.node_dim),
-                        self.improved, self.add_self_loops, dtype=x.dtype)
-                    if self.cached:
-                        self._cached_adj_t = edge_index
-                else:
-                    edge_index = cache
-
-        support = x + torch.matmul(x, self.weight1)
-        attention_score = self.lr_att(torch.cat([support, h0], dim=1))
-        initial = torch.mul(attention_score, h0)+torch.mul((1 -
-                                                            attention_score), torch.matmul(h0, self.weight2))
-        out = self.propagate(edge_index, x=support, edge_weight=edge_weight,
-                             size=None)+initial
+        attention_score = self.lr_att(torch.cat([x, h0], dim=1))
+        support = torch.matmul(x+h0, self.weight1)
+#        initial = torch.mul(attention_score, h0)+torch.mul((1 -
+#                                                            attention_score), torch.matmul(h0, self.weight2))
+        out = self.propagate(edge_index, x=torch.mul(attention_score, support)+torch.mul((1 - attention_score), h0),
+                             norm=norm)
         out = self.norm(out)
         return out
 
-    def message(self, x_j, edge_weight):
-        assert edge_weight is not None
-        return edge_weight.view(-1, 1) * x_j
+    def message(self, x_j, norm):
+        return norm.view(-1, 1) * x_j
 
     def message_and_aggregate(self, adj_t, x):
         return matmul(adj_t, x, reduce=self.aggr)

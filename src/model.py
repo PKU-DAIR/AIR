@@ -8,20 +8,17 @@ import math
 
 class GraphConvolution(nn.Module):
 
-    def __init__(self, in_features, out_features, hid_features):
+    def __init__(self, in_features, out_features):
         super(GraphConvolution, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.hid_features = hid_features
         self.weight = Parameter(torch.FloatTensor(
             self.in_features, self.out_features))
-        self.lr_att = nn.Linear(in_features+hid_features, 1)
         self.reset_parameters()
 
     def reset_parameters(self):
         stdv = 1. / math.sqrt(self.out_features)
         self.weight.data.uniform_(-stdv, stdv)
-        self.lr_att.reset_parameters()
 
     def forward(self, input, adj):
         input = torch.spmm(adj, input)
@@ -30,41 +27,42 @@ class GraphConvolution(nn.Module):
 
 
 class gcn_air(nn.Module):
-    def __init__(self, nfeat, nhid, nclass, dropout, num_hops, adj):
+    def __init__(self, nfeat, nhid, nclass, dropout, num_hops):
         super(gcn_air, self).__init__()
-        self.fc = nn.Linear(nhid, nclass)
-        self.lr_att = nn.Linear(nfeat+nhid, 1)
-
-        self.gcs = nn.ModuleList()
-        self.gcs.append(GraphConvolution(nfeat, nhid, nhid))
-        for _ in range(num_hops-1):
-            self.gcs.append(GraphConvolution(nhid, nhid, nhid))
-
+        self.num_layers = num_hops
+        self.convs = nn.ModuleList()
+        self.convs.append(GraphConvolution(nfeat, nhid))
+        for i in range(self.num_layers-1):
+            self.convs.append(GraphConvolution(nhid, nhid))
         self.dropout = dropout
-        self.adj = adj
-        self.num_hops = num_hops
+        self.out_fc = nn.Linear(nhid, nclass)
+        self.lr_att = nn.Linear(nhid+nhid, 1)
+        self.prelu = nn.PReLU()
+        self.bn = torch.nn.BatchNorm1d(nhid)
 
-    def forward(self, features):
-        h_list = []
-        h_list.append(features)
-        for i in range(self.num_hops):
-            features = self.gcs[i](features, self.adj)
-            features = F.relu(features)
-            features = F.dropout(features, self.dropout,
-                                 training=self.training)
-            h_list.append(features)
+    def reset_parameters(self):
+        for conv in self.convs:
+            conv.reset_parameters()
+        self.input_fc.reset_parameters()
+        self.out_fc.reset_parameters()
+        self.lr_att.reset_reset_parameters()
 
-        num_node = features.shape[0]
-        attention_scores = [torch.sigmoid(self.lr_att(torch.cat(
-            (x, h_list[0]), dim=1)).view(num_node, 1)) for x in h_list[1:]]
-        W = torch.cat(attention_scores, dim=1)
-        W = F.softmax(W, 1)
-        output = torch.mul(h_list[1], W[:, 0].view(num_node, 1))
-        for i in range(1, self.num_hops):
-            output += torch.mul(h_list[i], W[:, i].view(num_node, 1))
-
-        output = self.fc(output)
-        return F.log_softmax(output, dim=1)
+    def forward(self, x, adj):
+        num_node = x.shape[0]
+        x = self.convs[0](x, adj)
+        x_input = x
+        for i in range(1, self.num_layers):
+            alpha = torch.sigmoid(self.lr_att(
+                torch.cat([x, x_input], dim=1))).view(num_node, 1)
+            x = (1-alpha)*x+(alpha)*x_input
+            x = self.prelu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = self.convs[i](x, adj)
+        x = self.out_fc(self.prelu(
+            F.dropout(x, p=self.dropout, training=self.training)))
+#        x = self.out_fc(x)
+        x = F.log_softmax(x, dim=1)
+        return x
 
 
 class appnp_air(nn.Module):
